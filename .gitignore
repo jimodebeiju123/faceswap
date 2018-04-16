@@ -2,7 +2,10 @@
 !*.py
 !*.md
 !*.txt
+!*.png
 !Dockerfile*
 !requirements*
-!lib/*.py
+!icons
+!lib
 !scripts
+!plugins

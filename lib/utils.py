@@ -1,46 +1,74 @@
 import cv2
-import numpy
+import sys
+from os.path import basename, exists
 
 from pathlib import Path
 from scandir import scandir
+import os
 
+image_extensions = [".jpg", ".jpeg", ".png", ".tif", ".tiff"]
 
 def get_folder(path):
     output_dir = Path(path)
-    # output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
+def get_image_paths(directory, exclude=[], debug=False):
+    exclude_names = [basename(Path(x).stem[:-1] + Path(x).suffix) for x in exclude]
+    dir_contents = []
 
-def get_image_paths(directory):
-    return [x.path for x in scandir(directory) if x.name.endswith('.jpg') or x.name.endswith('.png')]
+    if not exists(directory):
+        directory = get_folder(directory).path
 
+    dir_scanned = sorted(os.scandir(directory), key=lambda x: x.name)
+    for x in dir_scanned:
+        if any([x.name.lower().endswith(ext) for ext in image_extensions]):
+            if x.name in exclude_names:
+                if debug:
+                    print("Already processed %s" % x.name)
+                continue
+            else:
+                dir_contents.append(x.path)
 
-def load_images(image_paths, convert=None):
-    iter_all_images = (cv2.imread(fn) for fn in image_paths)
-    if convert:
-        iter_all_images = (convert(img) for img in iter_all_images)
-    for i, image in enumerate(iter_all_images):
-        if i == 0:
-            all_images = numpy.empty((len(image_paths), ) + image.shape, dtype=image.dtype)
-        all_images[i] = image
-    return all_images
+    return dir_contents
 
+# From: https://stackoverflow.com/questions/22041699/rotate-an-image-without-cropping-in-opencv-in-c
+def rotate_image(image, angle, rotated_width=None, rotated_height=None):
+    height, width = image.shape[:2]
+    image_center = (width/2, height/2)
+    rotation_matrix = cv2.getRotationMatrix2D(image_center, -1.*angle, 1.)
+    if rotated_width is None or rotated_height is None:
+        abs_cos = abs(rotation_matrix[0, 0])
+        abs_sin = abs(rotation_matrix[0, 1])
+        if rotated_width is None:
+            rotated_width = int(height*abs_sin + width*abs_cos)
+        if rotated_height is None:
+            rotated_height = int(height*abs_cos + width*abs_sin)
+    rotation_matrix[0, 2] += rotated_width/2 - image_center[0]
+    rotation_matrix[1, 2] += rotated_height/2 - image_center[1]
+    return cv2.warpAffine(image, rotation_matrix, (rotated_width, rotated_height))
 
-def get_transpose_axes(n):
-    if n % 2 == 0:
-        y_axes = list(range(1, n - 1, 2))
-        x_axes = list(range(0, n - 1, 2))
-    else:
-        y_axes = list(range(0, n - 1, 2))
-        x_axes = list(range(1, n - 1, 2))
-    return y_axes, x_axes, [n - 1]
+# From: https://stackoverflow.com/questions/7323664/python-generator-pre-fetch
+import threading
+import queue as Queue
+class BackgroundGenerator(threading.Thread):
+    def __init__(self, generator, prefetch=1): #See below why prefetch count is flawed
+        threading.Thread.__init__(self)
+        self.queue = Queue.Queue(prefetch)
+        self.generator = generator
+        self.daemon = True
+        self.start()
 
+    def run(self):
+        # Put until queue size is reached. Note: put blocks only if put is called while queue has already reached max size
+        # => this makes 2 prefetched items! One in the queue, one waiting for insertion!
+        for item in self.generator:
+            self.queue.put(item)
+        self.queue.put(None)
 
-def stack_images(images):
-    images_shape = numpy.array(images.shape)
-    new_axes = get_transpose_axes(len(images_shape))
-    new_shape = [numpy.prod(images_shape[x]) for x in new_axes]
-    return numpy.transpose(
-        images,
-        axes=numpy.concatenate(new_axes)
-        ).reshape(new_shape)
+    def iterator(self):
+        while True:
+            next_item = self.queue.get()
+            if next_item is None:
+                break
+            yield next_item

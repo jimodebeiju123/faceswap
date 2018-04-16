@@ -1,13 +1,20 @@
-import face_recognition
-from .DetectedFace import DetectedFace
+from lib import FaceLandmarksExtractor
 
-def crop_faces(frame):
-    face_locations = face_recognition.face_locations(frame)
-    #face_encodings = face_recognition.face_encodings(frame, face_locations)
+def detect_faces(frame, detector, verbose, rotation=0):
+    fd = FaceLandmarksExtractor.extract (frame, detector, verbose)
+    for face in fd:
+        x, y, right, bottom, landmarks = face[0][0], face[0][1], face[0][2], face[0][3], face[1]
+        yield DetectedFace(frame[y: bottom, x: right], rotation, x, right - x, y, bottom - y, landmarksXY=landmarks)
 
-    for (top, right, bottom, left) in face_locations:
-        x = left
-        y = top
-        w = right - left
-        h = bottom - top
-        yield DetectedFace(frame[y: y + h, x: x + w], x, w, y, h, None)
+class DetectedFace(object):
+    def __init__(self, image=None, r=0, x=None, w=None, y=None, h=None, landmarksXY=None):
+        self.image = image
+        self.r = r
+        self.x = x
+        self.w = w
+        self.y = y
+        self.h = h
+        self.landmarksXY = landmarksXY
+
+    def landmarksAsXY(self):
+        return self.landmarksXY

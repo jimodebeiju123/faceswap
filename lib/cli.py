@@ -1,15 +1,32 @@
 import argparse
 import os
-import cv2
-import numpy
+import sys
+import time
 
-from lib.utils import get_image_paths, get_folder, load_images, stack_images
-from lib.faces_detect import crop_faces
-from lib.training_data import get_training_data
+from pathlib import Path
+from lib.utils import get_image_paths, get_folder, rotate_image
+from lib import Serializer
 
-from lib.model import autoencoder_A, autoencoder_B
-from lib.model import encoder, decoder_A, decoder_B
+# DLIB is a GPU Memory hog, so the following modules should only be imported when required
+detect_faces = None
+DetectedFace = None
+FaceFilter = None
 
+def import_faces_detect():
+    ''' Import the faces_detect module only when it is required '''
+    global detect_faces
+    global DetectedFace
+    if detect_faces is None or DetectedFace is None:
+        import lib.faces_detect 
+        detect_faces = lib.faces_detect.detect_faces
+        DetectedFace = lib.faces_detect.DetectedFace
+
+def import_FaceFilter():
+    ''' Import the FaceFilter module only when it is required '''
+    global FaceFilter
+    if FaceFilter is None:
+        import lib.FaceFilter
+        FaceFilter = lib.FaceFilter.FaceFilter
 
 class FullPaths(argparse.Action):
     """Expand user- and relative-paths"""
@@ -18,134 +35,15 @@ class FullPaths(argparse.Action):
         setattr(namespace, self.dest, os.path.abspath(
             os.path.expanduser(values)))
 
-
-class TrainingProcessor(object):
-    arguments = None
-
-    def __init__(self, subparser, command, description='default'):
-        self.parse_arguments(description, subparser, command)
-
-    def process_arguments(self, arguments):
-        self.arguments = arguments
-        print("Model A Directory: {}".format(self.arguments.input_A))
-        print("Model B Directory: {}".format(self.arguments.input_B))
-        print("Training data directory: {}".format(self.arguments.model_dir))
-        print('Starting, this may take a while...')
-
-        try:
-            encoder.load_weights(self.arguments.model_dir + '/encoder.h5')
-            decoder_A.load_weights(self.arguments.model_dir + '/decoder_A.h5')
-            decoder_B.load_weights(self.arguments.model_dir + '/decoder_B.h5')
-        except Exception as e:
-            print('Not loading existing training data.')
-            print(e)
-
-        self.process()
-
-    def parse_arguments(self, description, subparser, command):
-        parser = subparser.add_parser(
-            command,
-            help="This command trains the model for the two faces A and B.",
-            description=description,
-            epilog="Questions and feedback: \
-            https://github.com/deepfakes/faceswap-playground"
-        )
-
-        parser.add_argument('-A', '--input-A',
-                            action=FullPaths,
-                            dest="input_A",
-                            default="input_A",
-                            help="Input directory. A directory containing training images for face A.\
-                             Defaults to 'input'")
-        parser.add_argument('-B', '--input-B',
-                            action=FullPaths,
-                            dest="input_B",
-                            default="input_B",
-                            help="Input directory. A directory containing training images for face B.\
-                             Defaults to 'input'")
-        parser.add_argument('-m', '--model-dir',
-                            action=FullPaths,
-                            dest="model_dir",
-                            default="models",
-                            help="Model directory. This is where the training data will \
-                                be stored. Defaults to 'model'")
-        parser.add_argument('-p', '--preview',
-                            action="store_true",
-                            dest="preview",
-                            default=False,
-                            help="Show preview output. If not specified, write progress \
-                            to file.")
-        parser.add_argument('-v', '--verbose',
-                            action="store_true",
-                            dest="verbose",
-                            default=False,
-                            help="Show verbose output")
-        parser = self.add_optional_arguments(parser)
-        parser.set_defaults(func=self.process_arguments)
-
-    def add_optional_arguments(self, parser):
-        # Override this for custom arguments
-        return parser
-
-    def save_model_weights(self):
-        encoder.save_weights(self.arguments.model_dir + '/encoder.h5')
-        decoder_A.save_weights(self.arguments.model_dir + '/decoder_A.h5')
-        decoder_B.save_weights(self.arguments.model_dir + '/decoder_B.h5')
-        print('save model weights')
-
-    def show_sample(self, test_A, test_B):
-        figure_A = numpy.stack([
-            test_A,
-            autoencoder_A.predict(test_A),
-            autoencoder_B.predict(test_A),
-        ], axis=1)
-        figure_B = numpy.stack([
-            test_B,
-            autoencoder_B.predict(test_B),
-            autoencoder_A.predict(test_B),
-        ], axis=1)
-
-        figure = numpy.concatenate([figure_A, figure_B], axis=0)
-        figure = figure.reshape((4, 7) + figure.shape[1:])
-        figure = stack_images(figure)
-
-        figure = numpy.clip(figure * 255, 0, 255).astype('uint8')
-
-        if self.arguments.preview is True:
-            cv2.imshow('', figure)
-        else:
-            cv2.imwrite('_sample.jpg', figure)
-
-    def process(self):
-        images_A = get_image_paths(self.arguments.input_A)
-        images_B = get_image_paths(self.arguments.input_B)
-        images_A = load_images(images_A) / 255.0
-        images_B = load_images(images_B) / 255.0
-
-        images_A += images_B.mean(axis=(0, 1, 2)) - \
-            images_A.mean(axis=(0, 1, 2))
-
-        print('press "q" to stop training and save model')
-
-        BATCH_SIZE = 64
-
-        for epoch in range(1000000):
-            warped_A, target_A = get_training_data(images_A, BATCH_SIZE)
-            warped_B, target_B = get_training_data(images_B, BATCH_SIZE)
-
-            loss_A = autoencoder_A.train_on_batch(warped_A, target_A)
-            loss_B = autoencoder_B.train_on_batch(warped_B, target_B)
-            print(loss_A, loss_B)
-
-            if epoch % 100 == 0:
-                self.save_model_weights()
-                self.show_sample(target_A[0:14], target_B[0:14])
-
-            key = cv2.waitKey(1)
-            if key == ord('q'):
-                self.save_model_weights()
-                exit()
-
+class FullHelpArgumentParser(argparse.ArgumentParser):
+    """
+    Identical to the built-in argument parser, but on error
+    it prints full help message instead of just usage information
+    """
+    def error(self, message):
+        self.print_help(sys.stderr)
+        args = {'prog': self.prog, 'message': message}
+        self.exit(2, '%(prog)s: error: %(message)s\n' % args)
 
 class DirectoryProcessor(object):
     '''
@@ -158,60 +56,228 @@ class DirectoryProcessor(object):
     input_dir = None
     output_dir = None
 
-    verify_output = False
     images_found = 0
-    images_processed = 0
-    faces_detected = 0
+    num_faces_detected = 0
+    faces_detected = dict()
+    verify_output = False
+    rotation_angles = None
 
     def __init__(self, subparser, command, description='default'):
+        self.argument_list = self.get_argument_list()
+        self.optional_arguments = self.get_optional_arguments()
         self.create_parser(subparser, command, description)
         self.parse_arguments(description, subparser, command)
+
+    @staticmethod
+    def get_argument_list():
+        ''' Put the arguments in a list so that they are accessible from both argparse and gui '''
+        argument_list = []
+        argument_list.append({ "opts": ('-i', '--input-dir'),
+                               "action": FullPaths,
+                               "dest": "input_dir",
+                               "default": "input",
+                               "help": "Input directory. A directory containing the files \
+                                you wish to process. Defaults to 'input'"})
+        argument_list.append({ "opts": ('-o', '--output-dir'),
+                               "action": FullPaths,
+                               "dest": "output_dir",
+                               "default": "output",
+                               "help": "Output directory. This is where the converted files will \
+                                be stored. Defaults to 'output'"})
+        argument_list.append({ "opts": ('--serializer', ),
+                               "type": str.lower,
+                               "dest": "serializer",
+                               "choices": ("yaml", "json", "pickle"),
+                               "help": "serializer for alignments file"})
+        argument_list.append({ "opts": ('--alignments', ),
+                               "type": str,
+                               "dest": "alignments_path",
+                               "help": "optional path to alignments file."})
+        argument_list.append({ "opts": ('-v', '--verbose'),
+                               "action": "store_true",
+                               "dest": "verbose",
+                               "default": False,
+                               "help": "Show verbose output"})
+        return argument_list
+
+    @staticmethod
+    def get_optional_arguments():
+        ''' Put the arguments in a list so that they are accessible from both argparse and gui '''
+        # Override this for custom arguments
+        argument_list = []
+        return argument_list
 
     def process_arguments(self, arguments):
         self.arguments = arguments
         print("Input Directory: {}".format(self.arguments.input_dir))
         print("Output Directory: {}".format(self.arguments.output_dir))
+        print("Filter: {}".format(self.arguments.filter))
+        self.serializer = None
+        if self.arguments.serializer is None and self.arguments.alignments_path is not None:
+            ext = os.path.splitext(self.arguments.alignments_path)[-1]
+            self.serializer = Serializer.get_serializer_fromext(ext)
+            print(self.serializer, self.arguments.alignments_path)
+        else:
+            self.serializer = Serializer.get_serializer(self.arguments.serializer or "json")
+        print("Using {} serializer".format(self.serializer.ext))
+
+        try:
+            if self.arguments.rotate_images is not None and self.arguments.rotate_images != "off":
+                if self.arguments.rotate_images == "on":
+                    self.rotation_angles = range(90, 360, 90)
+                else:
+                    rotation_angles = [int(angle) for angle in self.arguments.rotate_images.split(",")]
+                    if len(rotation_angles) == 1:
+                        rotation_step_size = rotation_angles[0]
+                        self.rotation_angles = range(rotation_step_size, 360, rotation_step_size)
+                    elif len(rotation_angles) > 1:
+                        self.rotation_angles = rotation_angles
+        except AttributeError:
+            pass
+
         print('Starting, this may take a while...')
 
-        self.output_dir = get_folder(self.arguments.output_dir)
         try:
-            self.input_dir = get_image_paths(self.arguments.input_dir)
+            if self.arguments.skip_existing:
+                self.already_processed = get_image_paths(self.arguments.output_dir)
+        except AttributeError:
+            pass
+    
+        self.output_dir = get_folder(self.arguments.output_dir)
+
+        try:
+            try:
+                if self.arguments.skip_existing:
+                    self.input_dir = get_image_paths(self.arguments.input_dir, self.already_processed)
+                    print('Excluding %s files' % len(self.already_processed))
+                else:
+                    self.input_dir = get_image_paths(self.arguments.input_dir)
+            except AttributeError:
+                self.input_dir = get_image_paths(self.arguments.input_dir)
         except:
             print('Input directory not found. Please ensure it exists.')
             exit(1)
 
-        self.images_found = len(self.input_dir)
-
-        self.process_directory()
-
-    def process_directory(self):
-        for filename in self.input_dir:
-            if self.arguments.verbose:
-                print('Processing: {}'.format(os.path.basename(filename)))
-
-            self.process_image(filename)
-            self.images_processed = self.images_processed + 1
-
+        self.filter = self.load_filter()
+        self.process()
         self.finalize()
 
+    def read_alignments(self):
+
+        fn = os.path.join(str(self.arguments.input_dir),"alignments.{}".format(self.serializer.ext))
+        if self.arguments.alignments_path is not None:
+            fn = self.arguments.alignments_path
+
+        try:
+            print("Reading alignments from: {}".format(fn))
+            with open(fn, self.serializer.roptions) as f:
+                self.faces_detected = self.serializer.unmarshal(f.read())
+        except Exception as e:
+            print("{} not read!".format(fn))
+            print(str(e))
+            self.faces_detected = dict()
+
+    def write_alignments(self):
+
+        fn = os.path.join(str(self.arguments.input_dir), "alignments.{}".format(self.serializer.ext))
+        if self.arguments.alignments_path is not None:
+            fn = self.arguments.alignments_path
+        print("Alignments filepath: %s" % fn)
+        
+        if self.arguments.skip_existing:
+            if os.path.exists(fn):
+                with open(fn, self.serializer.roptions) as inf:
+                    data = self.serializer.unmarshal(inf.read())
+                    for k, v in data.items():
+                        self.faces_detected[k] = v
+            else:
+                print('Existing alignments file "%s" not found.' % fn)
+        try:
+            print("Writing alignments to: {}".format(fn))
+            with open(fn, self.serializer.woptions) as fh:
+                fh.write(self.serializer.marshal(self.faces_detected))
+        except Exception as e:
+            print("{} not written!".format(fn))
+            print(str(e))
+            self.faces_detected = dict()
+
+    def read_directory(self):
+        self.images_found = len(self.input_dir)
+        return self.input_dir
+
+    def have_face(self, filename):
+        return os.path.basename(filename) in self.faces_detected
+
+    def have_alignments(self):
+        fn = os.path.join(str(self.arguments.input_dir), "alignments.{}".format(self.serializer.ext))
+        return os.path.exists(fn)
+
+    def get_faces_alignments(self, filename, image):
+        import_faces_detect()
+        faces_count = 0
+        faces = self.faces_detected[os.path.basename(filename)]
+        for rawface in faces:
+            face = DetectedFace(**rawface)
+            # Rotate the image if necessary
+            if face.r != 0: image = rotate_image(image, face.r)
+            face.image = image[face.y : face.y + face.h, face.x : face.x + face.w]
+            if self.filter is not None and not self.filter.check(face):
+                if self.arguments.verbose:
+                    print('Skipping not recognized face!')
+                continue
+
+            yield faces_count, face
+            self.num_faces_detected += 1
+            faces_count += 1
+        if faces_count > 1 and self.arguments.verbose:
+            print('Note: Found more than one face in an image! File: %s' % filename)
+            self.verify_output = True
+
+    def get_faces(self, image, rotation=0):
+        import_faces_detect()
+        faces_count = 0
+        faces = detect_faces(image, self.arguments.detector, self.arguments.verbose, rotation)
+        
+        for face in faces:
+            if self.filter is not None and not self.filter.check(face):
+                if self.arguments.verbose:
+                    print('Skipping not recognized face!')
+                continue
+            yield faces_count, face
+
+            self.num_faces_detected += 1
+            faces_count += 1
+
+        if faces_count > 1 and self.arguments.verbose:
+            self.verify_output = True
+
+    def load_filter(self):
+        nfilter_files = self.arguments.nfilter
+        if not isinstance(self.arguments.nfilter, list):
+            nfilter_files = [self.arguments.nfilter]
+        nfilter_files = list(filter(lambda fn: Path(fn).exists(), nfilter_files))
+
+        filter_files = self.arguments.filter
+        if not isinstance(self.arguments.filter, list):
+            filter_files = [self.arguments.filter]
+        filter_files = list(filter(lambda fn: Path(fn).exists(), filter_files))
+        
+        if filter_files:
+            import_FaceFilter()
+            print('Loading reference images for filtering: %s' % filter_files)
+            return FaceFilter(filter_files, nfilter_files, self.arguments.ref_threshold)
+
+    # for now, we limit this class responsability to the read of files. images and faces are processed outside this class
+    def process(self):
+        # implement your image processing!
+        raise NotImplementedError()
+
     def parse_arguments(self, description, subparser, command):
-        self.parser.add_argument('-i', '--input-dir',
-                            action=FullPaths,
-                            dest="input_dir",
-                            default="input",
-                            help="Input directory. A directory containing the files \
-                            you wish to process. Defaults to 'input'")
-        self.parser.add_argument('-o', '--output-dir',
-                            action=FullPaths,
-                            dest="output_dir",
-                            default="output",
-                            help="Output directory. This is where the converted files will \
-                                be stored. Defaults to 'output'")
-        self.parser.add_argument('-v', '--verbose',
-                            action="store_true",
-                            dest="verbose",
-                            default=False,
-                            help="Show verbose output")
+        for option in self.argument_list:
+            args = option['opts']
+            kwargs = {key: option[key] for key in option.keys() if key != 'opts'}
+            self.parser.add_argument(*args, **kwargs)
+        
         self.parser = self.add_optional_arguments(self.parser)
         self.parser.set_defaults(func=self.process_arguments)
 
@@ -225,31 +291,16 @@ class DirectoryProcessor(object):
         return parser
 
     def add_optional_arguments(self, parser):
-        # Override this for custom arguments
+        for option in self.optional_arguments:
+            args = option['opts']
+            kwargs = {key: option[key] for key in option.keys() if key != 'opts'}
+            parser.add_argument(*args, **kwargs)
         return parser
-
-    def process_image(self, filename):
-        try:
-            image = cv2.imread(filename)
-            for (idx, face) in enumerate(crop_faces(image)):
-                if idx > 0 and self.arguments.verbose:
-                    print('- Found more than one face!')
-                    self.verify_output = True
-
-                self.process_face(face, idx, filename)
-                self.faces_detected = self.faces_detected + 1
-        except Exception as e:
-            print('Failed to extract from image: {}. Reason: {}'.format(filename, e))
-
-    def process_face(self, face, index, filename):
-        # implement your face processing!
-        raise NotImplementedError()
 
     def finalize(self):
         print('-------------------------')
         print('Images found:        {}'.format(self.images_found))
-        print('Images processed:    {}'.format(self.images_processed))
-        print('Faces detected:      {}'.format(self.faces_detected))
+        print('Faces detected:      {}'.format(self.num_faces_detected))
         print('-------------------------')
 
         if self.verify_output:
